@@ -1,6 +1,6 @@
 // Fixture server for the browser control layer. node:http only.
 //
-// It listens on every loopback address, so the same pages answer on three sites:
+// It answers on every loopback address, so the same pages answer on three sites:
 //   http://localhost:8787   the main site
 //   http://127.0.0.1:8787   a second site: frames from it are cross-site, and it plays the denied site
 //   http://[::1]:8787       a third site, for frames nested two deep across sites
@@ -32,7 +32,10 @@
 //   GET  /__posthog/events        the events it received, oldest first
 //   POST /__posthog/reset         clears them; { fail: n } makes the next n events fail
 //   GET  /__live/keys             provider keys from this process's environment, only when NB_LIVE=1 (for the
-//                                 live provider check; keys are never written to a file)
+//                                 live provider check; keys are never written to a file). Refused to web pages:
+//                                 only a request with no Origin or an extension's Origin gets them
+//
+// The socket listens on every interface (dual-stack '::'), but a client that is not on this machine is refused.
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
@@ -67,6 +70,11 @@ export function queueAutorunJob(job) {
 function count(req, path) {
   const key = `${req.headers.host} ${req.method} ${path}`;
   counters.set(key, (counters.get(key) ?? 0) + 1);
+}
+
+/** Whether the client is on this machine: 127.0.0.0/8 or ::1, also as an IPv4-mapped IPv6 address. */
+function isLoopback(address = '') {
+  return address === '::1' || /^(::ffff:)?127\./.test(address);
 }
 
 function readBody(req) {
@@ -149,13 +157,22 @@ async function handle(req, res) {
     }
     if (path === '/__live/keys') {
       if (process.env.NB_LIVE !== '1') return send(res, 403, { error: 'set NB_LIVE=1' });
+      // A page's script cannot drop or forge its Origin, so this keeps the keys from any web page, including one
+      // whose name resolves to this machine. The extension's worker sends chrome-extension://… or nothing.
+      const origin = req.headers.origin;
+      if (origin && !origin.startsWith('chrome-extension://')) return send(res, 403, { error: 'not for web pages' });
       const env = process.env;
-      return send(res, 200, {
-        anthropic: env.ANTHROPIC_API_KEY,
-        openai: env.OPENAI_API_KEY,
-        gemini: env.GEMINI_API_KEY ?? env.GOOGLE_GENERATIVE_AI_API_KEY,
-        openrouter: env.OPENROUTER_API_KEY,
-      });
+      // Written without send(), so without access-control-allow-origin: the extension reads it through its host
+      // permission, and no page may.
+      res.writeHead(200, { 'content-type': TYPES['.json'], 'cache-control': 'no-store' });
+      return res.end(
+        JSON.stringify({
+          anthropic: env.ANTHROPIC_API_KEY,
+          openai: env.OPENAI_API_KEY,
+          gemini: env.GEMINI_API_KEY ?? env.GOOGLE_GENERATIVE_AI_API_KEY,
+          openrouter: env.OPENROUTER_API_KEY,
+        }),
+      );
     }
     return send(res, 404, { error: 'unknown endpoint' });
   }
@@ -352,6 +369,8 @@ function escapeHtml(s) {
 
 export function startServer(port = PORT) {
   const server = createServer((req, res) => {
+    // Other machines on the network get nothing: not the pages, the recorded posts or the live keys.
+    if (!isLoopback(req.socket.remoteAddress)) return send(res, 403, 'forbidden');
     handle(req, res).catch(error => {
       console.error(error);
       if (!res.headersSent) send(res, 500, String(error));
@@ -359,7 +378,7 @@ export function startServer(port = PORT) {
   });
   return new Promise((resolveServer, reject) => {
     server.once('error', reject);
-    // '::' with dual-stack answers on localhost, 127.0.0.1 and [::1].
+    // '::' with dual-stack answers on localhost, 127.0.0.1 and [::1]; other clients are refused above.
     server.listen({ port, host: '::', ipv6Only: false }, () => resolveServer(server));
   });
 }
